@@ -1002,6 +1002,196 @@ class OpenAIlikedTranslator(OpenAITranslator):
         self.prompttext = prompt
 
 
+class ClaudeSDKTranslator(BaseTranslator):
+    """Use Claude SDK (via Claude Code CLI) for translation.
+
+    Env vars:
+      - CLAUDE_SDK_MODEL: preferred model token, e.g. 'sonnet' or 'haiku' or full 'claude-sonnet-4-5'
+      - CLAUDE_CLI_PATH: absolute path to 'claude' CLI (optional; else discovered via PATH)
+    """
+
+    name = "claude-sdk"
+    envs = {
+        "CLAUDE_SDK_MODEL": "claude-sonnet-4-5",
+        "CLAUDE_CLI_PATH": None,
+    }
+    CustomPrompt = True
+
+    def __init__(
+        self, lang_in, lang_out, model, envs=None, prompt=None, ignore_cache=False
+    ):
+        # Lazy import to avoid hard dependency when not used
+        self.set_envs(envs)
+        from claude_agent_sdk import ClaudeAgentOptions  # type: ignore
+
+
+        # Normalize model
+        model_in = model or self.envs.get("CLAUDE_SDK_MODEL") or "claude-sonnet-4-5"
+        model_token = str(model_in).lower()
+        if "haiku" in model_token:
+            model_token = "haiku"
+        elif "sonnet" in model_token:
+            model_token = "sonnet"
+        # Fall back to sonnet
+        if model_token not in {"sonnet", "haiku"}:
+            model_token = "sonnet"
+
+        super().__init__(lang_in, lang_out, model_token, ignore_cache)
+        self.prompttext = prompt
+        # Prepare SDK options
+        import os as _os
+        cli_path = _os.getenv("CLAUDE_CLI_PATH") or self.envs.get("CLAUDE_CLI_PATH")
+        default_sp = (
+            "You are a professional, authentic machine translation engine. "
+            "Only output the translated text in the target language. "
+            "Do not add any preface, disclaimers, or explanations. "
+            "Keep the formula notation {v*} unchanged."
+        )
+        system_prompt = _os.getenv("CLAUDE_SDK_SYSTEM_PROMPT") or default_sp
+        self._system_prompt = system_prompt
+        extra_args = {}
+        if _os.getenv("PDF_TRANSLATE_DEBUG") in {"1", "true", "TRUE", "yes", "on"}:
+            extra_args["debug-to-stderr"] = None
+        self._sdk_options = ClaudeAgentOptions(
+            model=model_token,
+            cli_path=cli_path,
+            system_prompt=system_prompt,
+            permission_mode="bypassPermissions",
+            allowed_tools=[],
+            disallowed_tools=[],
+            setting_sources=["local"],
+            include_partial_messages=False,
+            continue_conversation=False,
+            max_turns=1,
+            extra_args=extra_args,
+        )
+
+    def do_translate(self, text) -> str:
+        # Build translation prompt consistent with other translators
+        # (Removed temp marker file writes used during debugging)
+        messages = self.prompt(text, self.prompttext)
+        prompt_text = (
+            messages[0]["content"]
+            if messages and isinstance(messages[0], dict)
+            else str(text)
+        )
+
+        import anyio
+        from claude_agent_sdk import query  # type: ignore
+
+        async def run_once() -> str:
+            chunks: list[str] = []
+            async for msg in query(prompt=prompt_text, options=self._sdk_options):
+                # We only need plain text content from assistant messages
+                try:
+                    from claude_agent_sdk.types import AssistantMessage, TextBlock  # type: ignore
+
+                    if isinstance(msg, AssistantMessage):
+                        for block in getattr(msg, "content", []) or []:
+                            if isinstance(block, TextBlock) and getattr(
+                                block, "text", None
+                            ):
+                                chunks.append(block.text)
+                except Exception:
+                    # Best-effort: ignore non-text events
+                    pass
+            out = "".join(chunks).strip()
+            job_dir = None
+            try:
+                from pathlib import Path as _P
+                jd = os.getenv("PDF_TRANSLATE_JOB_DIR")
+                if jd:
+                    job_dir = _P(jd)
+                    (job_dir / "debug").mkdir(parents=True, exist_ok=True)
+                    (job_dir / "debug" / "claude_options.json").write_text(
+                        __import__("json").dumps(
+                            {
+                                "model": self.model,
+                                "system_prompt": getattr(self, "_system_prompt", "")[:200],
+                                "permission_mode": self._sdk_options.permission_mode,
+                                "setting_sources": self._sdk_options.setting_sources,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    (job_dir / "debug" / "output_raw.txt").write_text(out, encoding="utf-8")
+            except Exception:
+                pass
+            # Try to strip assistant/persona prefaces if any
+            try:
+                import re as _re
+                # 1) If the model added a generic English preface (e.g., "I'm Claude Code..."),
+                #    remove that whole paragraph when it appears near the beginning.
+                head = out[:1500]
+                persona_re = _re.compile(
+                    r"(?is)\b("
+                    r"i\s+appreciate\s+your\s+request|"
+                    r"i\s+should\s+clarify|"
+                    r"i'?m\s+claude(?:\s+code)?|"
+                    r"software\s+engineering\s+assistant|"
+                    r"not\s+a\s+pure\s+translation\s+engine|"
+                    r"if\s+you\s+need\s+help\s+with\s+translation|"
+                    r"workflows?|automation|integration\s+with\s+your\s+codebase"
+                    r")\b"
+                )
+                m_pref = persona_re.search(head)
+                if m_pref:
+                    # Expand to paragraph boundaries but DO NOT remove
+                    # any preceding line (e.g., a translated heading).
+                    # Start from the beginning of the matched line,
+                    # end at the first blank line after the match.
+                    start = out.rfind("\n", 0, m_pref.start())
+                    start = 0 if start == -1 else start + 1
+                    end = out.find("\n\n", m_pref.end())
+                    if end == -1:
+                        # Fallback: end of current line
+                        end = out.find("\n", m_pref.end())
+                        end = len(out) if end == -1 else end
+                    out = (out[:start] + out[end:]).strip()
+
+                # 2) If there's a leading non-Chinese run before the first Chinese char, drop it
+                #    (common when models preface the answer in English).
+                m_cjk = _re.search(r"[\u4e00-\u9fff]", out)
+                if m_cjk:
+                    out = out[m_cjk.start():]
+
+                # 3) Remove common explicit markers some models prepend.
+                out = _re.sub(r"(?is)^.*?(译文：|翻译如下：)", "", out).strip()
+
+                # 4) As a final safeguard within the first paragraph, drop pure-ASCII lines
+                #    that contain obvious persona words (assistant/Claude/translation request).
+                first_para_end = out.find("\n\n")
+                para = out if first_para_end == -1 else out[:first_para_end]
+                rest = "" if first_para_end == -1 else out[first_para_end:]
+                cleaned_lines = []
+                for ln in para.splitlines():
+                    if (
+                        not _re.search(r"[\u4e00-\u9fff]", ln)
+                        and _re.search(r"(?i)\b(claude|assistant|request|clarify|codebase|workflow|automation)\b", ln)
+                        and len(ln.strip()) > 10
+                    ):
+                        # skip persona-ish line
+                        continue
+                    cleaned_lines.append(ln)
+                out = "\n".join(cleaned_lines).strip() + rest
+                out = out.strip()
+            except Exception:
+                pass
+            try:
+                if job_dir:
+                    (job_dir / "debug" / "output_cleaned.txt").write_text(out, encoding="utf-8")
+            except Exception:
+                pass
+            if not out:
+                # Last resort: return empty translation marker to avoid None
+                return ""
+            return out
+
+        return anyio.run(run_once)
+
+
 class QwenMtTranslator(OpenAITranslator):
     """
     Use Qwen-MT model from Aliyun. it's designed for translating.
